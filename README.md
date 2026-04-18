@@ -7,7 +7,7 @@ The analysis consolidates daily observations into visualizations and insights th
 
 - RMarkdown file containing full analysis (`04.15_assignment1.Rmd`)  
 - Dataset with daily tracking variables (`04.15_metrics.xlsx`)  
-- Report with findings (`04.15_assignment1`)
+- Report with findings (`04.15_assignment1.docx`)
 
 ## Key Figures
 - Figure 1: Sleep Hours vs. Morning Alertness
