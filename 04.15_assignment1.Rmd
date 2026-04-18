@@ -1,0 +1,125 @@
+---
+title: "04.15_assignment1"
+author: "Ashley Marietta"
+date: "2026-04-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## IMPORT DATA
+```{r}
+library(ggplot2)
+library(data.table)
+library(readxl)
+metrics <- read_excel("04.15_metrics.xlsx")
+summary(metrics)
+```
+## MELT DATA TO LONG FORM
+```{r}
+# convert to data.table for melting
+dt <- as.data.table(metrics)
+
+# scale 1-5 variables to 0-1 scale of binary variables
+dt[,`Wake Up (Scaled)` := (`Wake Up` - 1) / 4]
+dt[,`Productivity (Scaled)` := (Productivity - 1) / 4]
+
+# melt data to long form, excluding Sleep Hours (different scale)
+plot_dat <- melt(dt,
+                 id.vars = c("Date", "Day"),
+                 measure.vars = c("Wake Up (Scaled)", "Productivity (Scaled)", "Caffeine Intake", "Eat Late Night Before"),
+                 variable.name = "Metric",
+                 value.name = "value")
+```
+
+```{r}
+# create plot
+g_1 <- ggplot(plot_dat,
+              aes(x = Date, y = value, color = Metric)) +
+  geom_jitter(alpha = 0.2, height = 0.1, aes(fill = Metric)) +
+  geom_smooth(se = FALSE) +
+  labs(title = "Scaled Metrics - 2026",
+       color = "Metric") +
+  guides(fill = "none") +
+  theme_minimal()
+
+g_1
+```
+
+## BUILD VISUALIZATIONS
+# CAFFEINE INTAKE VS. PRODUCTIVITY
+```{r}
+# really not descriptive
+g_2 <- ggplot(metrics, aes(x = factor(`Caffeine Intake`), y = Productivity)) +
+  geom_boxplot() +
+  labs(x = "Caffeine Intake (0 = No, 1 = Yes)",
+       y = "Productivity",
+       title = "Productivity vs. Caffeine Intake") +
+  theme_minimal()
+
+g_2
+```
+
+# SLEEP HOURS VS. PRODUCTIVITY
+```{r}
+# create scaled versions
+dt[, `Sleep Hours (Scaled)` := (`Sleep Hours` - min(`Sleep Hours`, na.rm = TRUE)) /
+                    (max(`Sleep Hours`, na.rm = TRUE) - min(`Sleep Hours`, na.rm = TRUE))]
+
+dt[, `Productivity (Scaled)` := (Productivity - min(Productivity, na.rm = TRUE)) /
+                            (max(Productivity, na.rm = TRUE) - min(Productivity, na.rm = TRUE))]
+
+# reshape
+sleepvprod <- melt(
+  dt,
+  id.vars = "Date",
+  measure.vars = c("Sleep Hours (Scaled)", "Productivity (Scaled)"),
+  variable.name = "Metric",
+  value.name = "value"
+)
+
+# plot
+g_3 <- ggplot(sleepvprod,
+              aes(x = Date, y = value, color = Metric)) +
+  geom_line() +
+  geom_point(alpha = 0.6) +
+  labs(title = "Sleep Hours vs. Productivity (Scaled)",
+       y = "Value",
+       color = "Metric") +
+  theme_minimal()
+
+g_3
+```
+
+# SLEEP HOURS VS. ENERGY
+```{r}
+# create scaled versions
+dt[, `Sleep Hours (Scaled)` := (`Sleep Hours` - min(`Sleep Hours`, na.rm = TRUE)) /
+                    (max(`Sleep Hours`, na.rm = TRUE) - min(`Sleep Hours`, na.rm = TRUE))]
+
+dt[, `Wake Up (Scaled)` := (`Wake Up` - min(`Wake Up`, na.rm = TRUE)) /
+                            (max(`Wake Up`, na.rm = TRUE) - min(`Wake Up`, na.rm = TRUE))]
+
+# reshape
+sleepvwup <- melt(
+  dt,
+  id.vars = "Date",
+  measure.vars = c("Sleep Hours (Scaled)", "Wake Up (Scaled)"),
+  variable.name = "Metric",
+  value.name = "value"
+)
+
+# plot
+g_4 <- ggplot(sleepvwup,
+              aes(x = Date, y = value, color = Metric)) +
+  geom_line() +
+  geom_point(alpha = 0.6) +
+  labs(title = "Sleep Hours vs. Wake Up Energy (Scaled)",
+       y = "Value",
+       color = "Metric") +
+  theme_minimal()
+
+g_4
+```

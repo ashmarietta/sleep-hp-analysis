@@ -1,0 +1,1013 @@
+---
+title: "Metric Analysis"
+author: "Mendoza College of Business, ITAO 40530"
+date: "Spring 2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+In this session we work with personal metric data, the same kind of self-tracked
+daily measurements you collected (or are collecting) for Assignment 1. The
+analysis has two goals:
+
+1. Construct **lagged summary features** from a daily metric so we can ask
+   questions like "does sleep over the last 3 days predict productivity today?"
+2. Use those features in a small predictive model and inspect which metrics
+   actually carry signal using SHAP.
+
+The same code runs against either the provided class dataset (a full year of
+metrics) or your own personal metric template. A single toggle at the top of
+the file controls which one is loaded.
+
+---
+
+# Set Up
+
+## Packages
+
+```{r}
+# install.packages("Hmisc")
+# install.packages("matrixStats")
+# install.packages("data.table")
+# install.packages("ggplot2")
+# install.packages("readxl")
+# install.packages("xgboost")
+# install.packages("shapviz")
+
+library(Hmisc)        # Lag function (kept available for reference)
+library(matrixStats)  # rowMaxs / rowMins for fast row-wise summaries
+library(data.table)   # data.table and the data.table::melt used for plotting
+library(ggplot2)      # plotting
+library(readxl)       # reading the personal metric xlsx template
+library(xgboost)      # gradient-boosted tree model
+library(shapviz)      # SHAP explanations (replaces the older sourced helper file)
+```
+
+## Plot theme
+
+Defining the palette and theme function once at the top means every plot in
+this file shares the same look. The same `theme_hpa()` function is used in
+later sessions (sourced from `explainer_functions.R`); we redefine it here
+so this file can be run standalone.
+
+```{r}
+# ---- Dark mode color palette used throughout this session ----
+dark_bg      <- "#0d1117"   # Deep background
+dark_panel   <- "#161b22"   # Panel background (slightly lighter)
+dark_grid    <- "#21262d"   # Subtle grid lines
+dark_text    <- "#e6edf3"   # Primary text
+dark_sub     <- "#8b949e"   # Subtitle / secondary text
+dark_axis    <- "#30363d"   # Axis lines
+accent_blue  <- "#58a6ff"   # Primary accent
+accent_red   <- "#f85149"   # Danger / injury
+accent_green <- "#3fb950"   # Success / healthy
+accent_gold  <- "#d29922"   # Warning / moderate
+
+# ---- Reusable dark theme for all plots in this session ----
+theme_hpa <- function() {
+  theme(
+    plot.background = element_rect(fill = dark_bg, color = NA),
+    panel.background = element_rect(fill = dark_panel, color = NA),
+    panel.grid.major = element_line(color = dark_grid, linewidth = 0.3),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line(color = dark_axis),
+    axis.text = element_text(color = dark_sub, size = 9),
+    axis.title = element_text(color = dark_text, size = 10),
+    plot.title = element_text(face = "bold", color = dark_text, size = 13),
+    plot.subtitle = element_text(color = dark_sub, size = 10),
+    legend.background = element_rect(fill = dark_bg, color = NA),
+    legend.key = element_rect(fill = dark_panel, color = NA),
+    legend.text = element_text(color = dark_text, size = 9),
+    legend.title = element_text(color = dark_text, size = 10),
+    strip.background = element_rect(fill = dark_grid, color = NA),
+    strip.text = element_text(color = dark_text, size = 10)
+  )
+}
+```
+
+
+## Loading data: class dataset or your own
+
+The single switch below controls which dataset gets loaded. Leave it at `FALSE`
+to follow along with the class data; flip it to `TRUE` once you have at least
+a couple of weeks of entries in your personal metric template and want to run
+the same pipeline on your own metrics.
+
+```{r}
+# ---- Data source toggle ----
+# FALSE -> load the class metric dataset (metric_data_2020.rda)
+# TRUE  -> load your filled-in Personal_Metric_Template.xlsx
+USE_STUDENT_DATA <- TRUE
+
+# ---- Paths (edit if your files live elsewhere) ----
+class_data_path   <- "metric_data_2020.rda"
+student_xlsx_path <- "04.15_metrics.xlsx"
+
+# ---- Optional: rename the two custom columns from the template ----
+# The template ships with generic "Metric 1" and "Metric 2" columns. If you
+# tracked, e.g., caffeine and steps, set them here so the plots and SHAP
+# output use the real names. Set to NULL to keep the defaults.
+student_custom_names <- c("Metric 1" = "Caffeine_mg",
+                          "Metric 2" = "Steps")
+# student_custom_names <- NULL
+```
+
+The loader below normalizes whichever source you chose into a single data
+frame called `metric_data`. Three things happen regardless of source:
+
+  * Column names get spaces replaced with underscores (so `Wake Up` becomes
+    `Wake_Up` and the rest of the file can reference columns by a single name).
+  * The `Date` column is converted to a numeric `day_index`, days since the
+    first observation. We use this index instead of row position when computing
+    lagged values, which means gaps in your data (skipped days) are handled
+    correctly: "3 days ago" really means 3 calendar days, not 3 rows back.
+  * Fully blank rows (common in a freshly-printed template) are dropped.
+
+```{r}
+# ---- Helper: normalize a raw data frame into the shape the rest of the file expects ----
+# This function takes whatever shape the source data arrives in (rda or xlsx)
+# and returns a data frame with three guarantees: column names contain no
+# spaces, every row has a numeric day_index, and there are no entirely-blank
+# rows. By isolating this prep work in a function, the rest of the file can
+# assume a clean input regardless of which source produced it.
+prepare_metric_data <- function(raw, rename_map = NULL) {
+
+  # ---- Step 1: Standardize column names ----
+  # Spaces in column names force students to write metric_data[["Wake Up"]]
+  # instead of metric_data$Wake_Up. Replacing spaces with underscores once
+  # here lets us use the cleaner $ syntax everywhere downstream.
+  names(raw) <- gsub(" ", "_", names(raw))
+
+  # ---- Step 2: Apply optional renaming for student custom columns ----
+  # The xlsx template has placeholder "Metric 1" / "Metric 2" columns. If the
+  # student supplied real names via rename_map, swap them in. We loop because
+  # there may be one, two, or zero renames depending on what the student set.
+  if (!is.null(rename_map)) {
+    map_from <- gsub(" ", "_", names(rename_map))
+    map_to   <- unname(rename_map)
+    for (k in seq_along(map_from)) {
+      hit <- which(names(raw) == map_from[k])
+      # which() returns integer(0) if no match, so length(hit) == 1 guards
+      # against both "no column found" and "duplicate column names".
+      if (length(hit) == 1) names(raw)[hit] <- map_to[k]
+    }
+  }
+
+  # ---- Step 3: Build the day_index from the Date column ----
+  # The lag calculations downstream need to know how many calendar days
+  # separate two rows. We compute that here as an integer offset from the
+  # earliest observation. If there's no Date column at all (unusual), we
+  # fall back to row position so the rest of the pipeline still runs.
+  if ("Date" %in% names(raw)) {
+    # Drop rows where Date is missing, these are blank template rows
+    raw <- raw[!is.na(raw$Date), , drop = FALSE]
+    # Coerce to Date class regardless of how it was read in (POSIXct from
+    # readxl, character from CSV, or already-Date from an rda)
+    raw$Date <- as.Date(raw$Date)
+    # Sort by date so that lag lookups based on day_index work correctly.
+    # The match() lookups don't strictly require sorting, but sorting makes
+    # head() / tail() inspections meaningful.
+    raw <- raw[order(raw$Date), , drop = FALSE]
+    # day_index = days since the earliest observation
+    raw$day_index <- as.integer(raw$Date - min(raw$Date, na.rm = TRUE))
+  } else {
+    # Fall back to row position when no Date column exists
+    raw$day_index <- seq_len(nrow(raw)) - 1L
+  }
+
+  # ---- Step 4: Drop fully blank rows ----
+  # A freshly printed template has dozens of empty rows below the last entry.
+  # If every metric column is NA in a row, that row contributes nothing.
+  metric_cols <- setdiff(names(raw), c("Date", "Day", "day_index"))
+  if (length(metric_cols) > 0) {
+    # rowSums on a logical matrix counts non-NA cells; == 0 means every cell
+    # in that row was NA.
+    all_na <- rowSums(!is.na(raw[, metric_cols, drop = FALSE])) == 0
+    raw <- raw[!all_na, , drop = FALSE]
+  }
+
+  # Reset row names so subsequent indexing is predictable. Without this we'd
+  # carry around the row numbers from the original sheet, which can confuse
+  # printouts and joins.
+  rownames(raw) <- NULL
+  raw
+}
+
+# ---- Actually load the data ----
+# The if/else picks the right loader based on the toggle. Note that load()
+# silently brings the object metric_data into the environment by name, which
+# is why we don't assign its return value to anything. read_xlsx() is the
+# modern equivalent that returns a value directly.
+if (USE_STUDENT_DATA) {
+  #raw <- read_excel("x04.15_metrics.xlsx")
+  raw <-x04_15_metrics 
+  metric_data <- prepare_metric_data(as.data.frame(raw),
+                                     rename_map = student_custom_names)
+  cat("Loaded student data:", nrow(metric_data), "rows,",
+      ncol(metric_data) - 3, "metrics.\n")
+} else {
+  load(class_data_path)  # introduces an object called metric_data
+  metric_data <- prepare_metric_data(metric_data)
+  cat("Loaded class data:", nrow(metric_data), "rows,",
+      ncol(metric_data) - 3, "metrics.\n")
+}
+
+tail(metric_data)
+```
+
+## Detecting which metrics are present
+
+Rather than hardcoding the list of metrics, we figure it out from the loaded
+data. Anything that isn't `Date`, `Day`, or `day_index`, and is numeric,
+counts as a metric we can analyze. This pattern (detect columns from the data
+rather than hardcoding) is what lets the same downstream code handle both the
+9-column class dataset and a 5-column student tracker without modification.
+
+```{r}
+# ---- Identify metric columns automatically ----
+# Step 1: list every column except the bookkeeping columns
+non_metric_cols <- c("Date", "Day", "day_index")
+metric_cols <- setdiff(names(metric_data), non_metric_cols)
+
+# Step 2: keep only the numeric ones. sapply returns a logical vector here
+# because is.numeric returns a single TRUE/FALSE per column. Filtering on
+# this guards against, e.g., a stray text column the student added.
+metric_cols <- metric_cols[sapply(metric_data[, metric_cols, drop = FALSE], is.numeric)]
+
+cat("Detected metrics:\n  ", paste(metric_cols, collapse = ", "), "\n")
+```
+
+---
+
+# Exploring the Raw Data
+
+Before we start building features, it's worth looking at what we actually
+have. Two questions matter most for a self-tracked dataset:
+
+  1. **Where are the gaps?** Personal tracking is never complete. Knowing
+     which metrics are missing when will shape how we interpret the model.
+  2. **What do these metrics look like over time?** Daily values are noisy.
+     Seeing the underlying trend (via a rolling average) is what motivates
+     building lagged summary features in the next section.
+
+## Data completeness heatmap
+
+Each row below is a metric, each column is a date, and the cell color tells
+you whether that value was recorded. This plot is the single most useful
+diagnostic for a personal-tracking dataset because it exposes structural
+gaps (metrics started late, metrics that drop off on weekends, travel
+periods where nothing was logged) that would otherwise silently corrupt
+downstream analysis.
+
+```{r fig.height=4, fig.width=10}
+# ---- Build a long-form presence indicator ----
+# For the heatmap we need one row per (Date, metric) combination with a
+# flag for whether the value is present. melt() handles the reshape; we
+# use data.table because it's already loaded and it's fast.
+completeness_dt <- as.data.table(metric_data[, c("Date", metric_cols)])
+completeness_long <- melt(completeness_dt, id.vars = "Date",
+                          variable.name = "metric", value.name = "value")
+
+# is_present = TRUE when the value is not NA. This becomes the fill color.
+completeness_long[, is_present := !is.na(value)]
+
+# ---- Plot ----
+# geom_tile gives us the calendar grid. We reverse the y axis so metrics
+# appear in the order they're listed in metric_cols (tile plots otherwise
+# show the first level at the bottom).
+ggplot(completeness_long, aes(x = Date, y = metric, fill = is_present)) +
+  geom_tile(color = dark_bg, linewidth = 0.05) +
+  scale_fill_manual(values = c(`TRUE` = accent_green, `FALSE` = dark_grid),
+                    labels = c(`TRUE` = "Recorded", `FALSE` = "Missing"),
+                    name = NULL) +
+  scale_y_discrete(limits = rev(metric_cols)) +
+  labs(x = NULL, y = NULL,
+       title = "Data completeness by metric and date",
+       subtitle = "Green cells are recorded values, dark cells are missing") +
+  theme_hpa() +
+  theme(legend.position = "top")
+```
+
+Things to look for in your own version of this plot: metrics that only
+started being recorded partway through, weekend gaps in evening metrics
+(Productivity and Energy often drop off when work rhythm changes), and
+long horizontal stretches of missing data that indicate periods to treat
+with extra skepticism in the modeling section.
+
+## Metric time series with 7-day rolling average
+
+Raw daily values are noisy enough that trends are hard to see by eye. A
+rolling mean smooths through the day-to-day variation and reveals the
+underlying trajectory. This plot also previews what the lag-summary features
+are doing mathematically: the `mean_val` column from our lag calculator is
+effectively this rolling mean.
+
+```{r fig.height=8, fig.width=10}
+# ---- Compute a 7-day rolling mean for every metric ----
+# We already have a function that computes this: lag_metric_calculator
+# with lagged_days = 6 and include_current = TRUE gives us a 7-day window.
+# Rather than writing a separate rolling-mean helper, we reuse the function
+# we'll soon use for modeling. This is a small payoff for the effort of
+# building the reusable function earlier.
+#
+# Note: this chunk runs before lag_metric_calculator is defined in the
+# walkthrough below, so we inline a minimal version here. In practice you'd
+# put the function definition before either use, but keeping it inline here
+# lets the walkthrough stand on its own.
+rolling_mean_7 <- function(vec, day_index) {
+  # Build a matrix with 7 columns (today + 6 prior days)
+  res_data <- matrix(NA_real_, nrow = length(vec), ncol = 7)
+  res_data[, 7] <- vec  # today in the rightmost column
+  for (i in 1:6) {
+    target_days <- day_index - i
+    match_idx   <- match(target_days, day_index)
+    res_data[, i] <- vec[match_idx]
+  }
+  rowMeans(res_data, na.rm = TRUE)
+}
+
+# ---- Build long-form data with both raw values and rolling mean ----
+ts_list <- list()
+for (m in metric_cols) {
+  vec <- metric_data[[m]]
+  ts_list[[m]] <- data.frame(
+    Date   = metric_data$Date,
+    metric = m,
+    raw    = vec,
+    smooth = rolling_mean_7(vec, metric_data$day_index)
+  )
+}
+ts_df <- do.call(rbind, ts_list)
+
+# ---- Plot: raw values as faint points, rolling mean as gold line ----
+# Faceting per metric with free_y scales because each metric has its own
+# range (Sleep_Hours is 0-10, Stress is 1-5, etc.). ncol = 2 gives a
+# readable layout for 9 metrics.
+ggplot(ts_df, aes(x = Date)) +
+  geom_point(aes(y = raw), color = accent_blue, alpha = 0.25, size = 0.8) +
+  geom_line(aes(y = smooth), color = accent_gold, linewidth = 0.7) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+  labs(x = NULL, y = "Metric value",
+       title = "Daily metrics over time with 7-day rolling average",
+       subtitle = "Blue points are daily values, gold line is the 7-day mean") +
+  theme_hpa()
+```
+
+The gold line is doing the same work that the `mean_val` feature will do
+in the model: averaging out day-to-day noise to expose the trend. If your
+rolling mean line is nearly flat for a metric, that metric has little
+medium-term variation to predict from; if it shows clear drift or cycles,
+there's signal the model can potentially use.
+
+---
+
+# Lagged Feature Construction
+
+A single bad night of sleep rarely shows up in next-day performance, but a
+*string* of bad nights usually does. To capture that we need features that
+summarize a metric over a recent window: its mean, sum, max, min, and how
+many of those days are missing.
+
+The lag function below uses the `day_index` column rather than row position.
+This matters whenever the dataset has gaps: if you skipped logging on Tuesday,
+"yesterday's value" on Wednesday should be Monday's, not blank.
+
+## Walking through the calculation for one metric
+
+We start by writing the calculation out for a single metric (`Sleep_Hours`),
+one window (7 days), with the current day included. Once that works we wrap
+it in a function. Doing it this way makes the loop logic visible before it
+gets buried inside a function body.
+
+```{r}
+# ---- Parameters for the worked example ----
+# These four values fully specify a single lag-summary calculation. They
+# become the function arguments in the next chunk.
+lagged_days <- 7              # how many calendar days back to include
+metric <- "Sleep_Hours"       # which column to summarize
+include_current <- TRUE       # include today's value as the rightmost column?
+
+# ---- Pull out the metric vector and the day index it lines up with ----
+# unlist() flattens the single-column data frame slice into a plain vector.
+# Without it, met_vec would still be a one-column data frame and the rest
+# of the math would silently produce something unexpected.
+met_vec   <- unlist(metric_data[, metric])
+day_index <- metric_data$day_index
+
+# ---- Allocate the result matrix ----
+# Each column holds the metric value at one lag offset. If we include today,
+# we need lagged_days + 1 columns; otherwise just lagged_days. NA_real_ is
+# used (rather than plain NA) so the matrix is numeric from the start; this
+# avoids R having to coerce the type later when we assign numeric values.
+n_cols <- if (include_current) lagged_days + 1 else lagged_days
+res_data <- matrix(NA_real_, nrow = nrow(metric_data), ncol = n_cols)
+
+# Today's value goes in the rightmost column when include_current = TRUE.
+# This convention (today on the right, oldest on the left) is arbitrary but
+# kept consistent across every call.
+if (include_current) {
+  res_data[, n_cols] <- met_vec
+}
+
+# ---- Fill in the lagged columns ----
+# This is the heart of the day_index-based lag. For each lag i:
+#   1. Compute the target day_index for every row (today minus i days).
+#   2. Use match() to find the row position (if any) with that day_index.
+#   3. Pull the metric value from that position.
+# match() returns NA whenever no such row exists, which is exactly the
+# behavior we want for the first few rows of the dataset and for any
+# genuine gaps in tracking.
+for (i in seq_len(lagged_days)) {
+  target_days <- day_index - i
+  match_idx   <- match(target_days, day_index)
+  res_data[, i] <- met_vec[match_idx]
+}
+
+# ---- Compute row-wise summaries across the lag window ----
+# rowMeans / rowSums are base R; rowMaxs / rowMins come from matrixStats
+# and are much faster than apply(res_data, 1, max). na.rm = TRUE means a
+# row with one missing day still produces a usable summary.
+mean_val     <- rowMeans(res_data, na.rm = TRUE)
+sum_val      <- rowSums(res_data, na.rm = TRUE)
+max_val      <- rowMaxs(res_data, na.rm = TRUE)
+min_val      <- rowMins(res_data, na.rm = TRUE)
+missing_vals <- rowSums(is.na(res_data))
+
+# ---- Repair edge case: rows that are entirely missing ----
+# When every value in a row is NA, rowMaxs returns -Inf and rowMins returns
+# +Inf (because the max of an empty set is, by convention, -Inf). Those
+# infinite values would crash plotting code downstream, so we coerce them
+# back to NA here.
+max_val[is.infinite(max_val)] <- NA
+min_val[is.infinite(min_val)] <- NA
+
+results <- data.frame(mean_val, sum_val, max_val, min_val, missing_vals)
+head(results)
+tail(results)
+```
+
+## Wrapping it in a function
+
+The same calculation will be needed for every metric and every lag window,
+which is a lot of repetition. Wrapping it in a function makes the modeling
+loop further down readable and removes the risk of typos creeping into one
+copy of the code but not another.
+
+```{r}
+# ---- Reusable lag-window summary function ----
+lag_metric_calculator <- function(metric_data,
+                                  lagged_days = 3,
+                                  metric = "Sleep_Hours",
+                                  include_current = TRUE) {
+  #'
+  #' Compute summary statistics over a rolling window of past values for a
+  #' single metric, using calendar-day spacing rather than row position.
+  #'
+  #' @param metric_data data frame with a numeric `day_index` column
+  #' @param lagged_days how many calendar days back to include in the window
+  #' @param metric column name of the metric to summarize
+  #' @param include_current if TRUE, today's value is included in the window
+  #'
+  #' @return data frame with mean, sum, max, min, and count of missing values
+  #'         across the window for every row in `metric_data`
+  #'
+
+  # Pull out the vectors we need (see the worked example above for why
+  # unlist is required here).
+  met_vec   <- unlist(metric_data[, metric])
+  day_index <- metric_data$day_index
+
+  # Allocate result matrix and fill in today's value if requested.
+  n_cols <- if (include_current) lagged_days + 1 else lagged_days
+  res_data <- matrix(NA_real_, nrow = nrow(metric_data), ncol = n_cols)
+  if (include_current) res_data[, n_cols] <- met_vec
+
+  # Fill the lagged columns by matching on day_index (gap-aware lag).
+  for (i in seq_len(lagged_days)) {
+    target_days <- day_index - i
+    match_idx   <- match(target_days, day_index)
+    res_data[, i] <- met_vec[match_idx]
+  }
+
+  # Row-wise summaries
+  mean_val     <- rowMeans(res_data, na.rm = TRUE)
+  sum_val      <- rowSums(res_data, na.rm = TRUE)
+  max_val      <- rowMaxs(res_data, na.rm = TRUE)
+  min_val      <- rowMins(res_data, na.rm = TRUE)
+  missing_vals <- rowSums(is.na(res_data))
+
+  # Replace infinite values from all-NA rows with NA
+  max_val[is.infinite(max_val)] <- NA
+  min_val[is.infinite(min_val)] <- NA
+
+  data.frame(mean_val, sum_val, max_val, min_val, missing_vals)
+}
+```
+
+## Computing summaries at three window lengths
+
+We pick three windows that span very different timescales: the last day
+(very short-term effects), a 3-day window (a long weekend's worth of
+recovery), and a week. Comparing how the same metric behaves across these
+three windows is what tells us which timescale carries the signal.
+
+```{r}
+# ---- Build sleep summaries at three window lengths ----
+# Each call returns a 5-column data frame: mean, sum, max, min, missing_vals
+# computed over a window of (lagged_days + include_current) days.
+lag_2_res <- lag_metric_calculator(metric_data, lagged_days = 1,
+                                   metric = "Sleep_Hours", include_current = TRUE)
+lag_3_res <- lag_metric_calculator(metric_data, lagged_days = 2,
+                                   metric = "Sleep_Hours", include_current = TRUE)
+lag_7_res <- lag_metric_calculator(metric_data, lagged_days = 6,
+                                   metric = "Sleep_Hours", include_current = TRUE)
+```
+
+---
+
+# Visualizing Lagged Sleep vs. Other Metrics
+
+We want to know whether recent sleep predicts how we feel or perform today.
+A quick way in is to plot each summary statistic against another metric.
+The helper below avoids repeating the same plotting code six times.
+
+```{r}
+# ---- Reusable plotting function ----
+# Takes a lag-summary data frame, a response vector, and labels, and produces
+# a faceted scatter plot with a smoother for each summary stat. Pulling this
+# into a function means we can swap the response variable (Productivity, Wake
+# Up, etc.) without copy-pasting twenty lines of ggplot code each time.
+plot_lag_vs_metric <- function(lag_res, response_col, response_name, lag_label) {
+  # ---- Combine the lagged summaries with the response column ----
+  plot_df <- cbind(lag_res, response = response_col)
+
+  # ---- Reshape to long form for faceting ----
+  # We need one row per (observation, summary_stat) pair so ggplot can facet
+  # by the summary stat. data.table::melt is fast and avoids a dependency on
+  # the older reshape / reshape2 packages.
+  plot_dt   <- as.data.table(plot_df)
+  plot_long <- melt(plot_dt, id.vars = "response",
+                    variable.name = "summary_stat", value.name = "value")
+
+  # ---- Build the plot ----
+  # Points are blue (calm, "data") and the smoother is gold (drawing the eye
+  # to the trend). Faceting uses free scales because mean, sum, max, and min
+  # live on very different ranges.
+  ggplot(plot_long, aes(x = value, y = response)) +
+    geom_point(alpha = 0.4, color = accent_blue) +
+    geom_smooth(method = "loess", se = FALSE, color = accent_gold, linewidth = 0.8) +
+    facet_wrap(~ summary_stat, scales = "free") +
+    labs(x = "Sleep summary value",
+         y = response_name,
+         title = paste(response_name, "vs. lagged Sleep Hours,", lag_label)) +
+    theme_hpa() +
+    theme(legend.position = "none")
+}
+```
+
+## Productivity vs. lagged sleep
+
+The interesting question here is whether the *window length* changes the
+picture. If only the last day matters, the 1-day plot will show a relationship
+the others do not; if accumulated debt matters more, the 7-day window will
+look cleanest.
+
+```{r}
+# Productivity is present in both the class dataset and the student template,
+# but if a student deleted the column we don't want to crash. The %in% check
+# is cheap insurance.
+if ("Productivity" %in% names(metric_data)) {
+  print(plot_lag_vs_metric(lag_2_res, metric_data$Productivity, "Productivity", "2-day window"))
+  print(plot_lag_vs_metric(lag_3_res, metric_data$Productivity, "Productivity", "3-day window"))
+  print(plot_lag_vs_metric(lag_7_res, metric_data$Productivity, "Productivity", "7-day window"))
+} else {
+  cat("No Productivity column in this dataset, skipping productivity plots.\n")
+}
+```
+
+## Wake Up vs. lagged sleep
+
+Wake Up is a self-rated quality of waking. We'd hope (but should not assume)
+that more sleep leads to easier mornings. Worth noting: if `include_current
+= TRUE` for the sleep window, this is partly tautological since last night's
+sleep is what produced this morning's Wake Up score. The gap between the
+1-day and 7-day windows is the more informative comparison.
+
+```{r}
+if ("Wake_Up" %in% names(metric_data)) {
+  print(plot_lag_vs_metric(lag_2_res, metric_data$Wake_Up, "Wake Up", "2-day window"))
+  print(plot_lag_vs_metric(lag_3_res, metric_data$Wake_Up, "Wake Up", "3-day window"))
+  print(plot_lag_vs_metric(lag_7_res, metric_data$Wake_Up, "Wake Up", "7-day window"))
+} else {
+  cat("No Wake_Up column in this dataset, skipping wake-up plots.\n")
+}
+```
+
+---
+
+# Predictive Modeling
+
+The plots give us intuition for individual metrics. To handle all of them at
+once, and to let interactions between metrics surface, we move to a model.
+Gradient-boosted trees handle small tabular datasets with mixed missingness
+gracefully, which is why XGBoost is a reasonable default here.
+
+## Building the full feature matrix
+
+For every detected metric and every lag window, we generate the same five
+summary stats. `Sleep_Hours` uses `include_current = TRUE` because we usually
+know last night's sleep before today's productivity is recorded. Other
+metrics use `include_current = FALSE` so we aren't predicting Productivity
+from itself.
+
+```{r}
+# ---- Modeling parameters ----
+# response_metric: the column we're trying to predict. Productivity is the
+# default; change this to predict Mood, Energy, or one of your custom
+# metrics. The rest of the modeling code reads from this variable, so you
+# only need to change it in one place.
+response_metric <- "Productivity"
+
+# lags: the window lengths (in days back) we'll build features for. Using
+# multiple windows lets the model figure out which timescale matters for
+# each metric on its own.
+lags <- c(1, 3, 7)
+
+# feature_metrics: every numeric metric except the response. Including the
+# response in the feature set would leak the answer (today's productivity
+# value would be available as a feature for predicting today's productivity),
+# so we explicitly remove it.
+feature_metrics <- setdiff(metric_cols, response_metric)
+```
+
+```{r}
+# ---- Construct the feature matrix ----
+# For each (lag, metric) combination, compute the 5 summary stats and tag
+# the column names with the metric name and lag length. The result is a
+# wide matrix where each column is interpretable from its name alone:
+#   mean_val_Sleep_Hours_7  = mean Sleep_Hours over the last 7 days
+#   max_val_Stress_3        = max Stress over the last 3 days (excluding today)
+res_list <- list()
+
+for (i in seq_along(lags)) {
+  for (j in seq_along(feature_metrics)) {
+    m <- feature_metrics[j]
+    # Sleep is the one metric where today's value (last night) is known
+    # in advance of the response, so we include it in its own window.
+    inc_current <- identical(m, "Sleep_Hours")
+    temp <- lag_metric_calculator(metric_data,
+                                  lagged_days = lags[i],
+                                  metric = m,
+                                  include_current = inc_current)
+    # Tag the column names so the SHAP plot is self-documenting
+    names(temp) <- paste(names(temp), m, lags[i], sep = "_")
+    res_list[[length(res_list) + 1]] <- temp
+  }
+}
+
+# do.call(cbind, res_list) is the base-R equivalent of list.cbind from rlist.
+# It stitches every data frame in res_list side by side into one wide matrix.
+m_dat <- do.call(cbind, res_list)
+cat("Feature matrix:", nrow(m_dat), "rows by", ncol(m_dat), "columns.\n")
+```
+
+## Setting the response and dropping rows we can't model
+
+```{r}
+# Pull out the response vector. Using [[ ]] returns a vector directly,
+# whereas $response_metric would look for a column literally called
+# "response_metric" (which doesn't exist).
+response <- metric_data[[response_metric]]
+
+# Drop any row where the response is missing. We can't train on rows where
+# we don't know the answer, and we can't validate against them either.
+keep <- !is.na(response)
+m_dat    <- m_dat[keep, , drop = FALSE]
+response <- response[keep]
+
+cat("After dropping missing-response rows:", nrow(m_dat), "rows remain.\n")
+```
+
+## Guarding against tiny datasets
+
+If you're running this against your own data after a couple of weeks of
+tracking, you won't have enough rows to train a deep boosted model. Rather
+than letting XGBoost overfit silently, we scale `nrounds` down to whatever
+the data can support and stop with a clear message if there isn't enough
+to fit anything sensible.
+
+```{r}
+# ---- Adapt model size to dataset size ----
+n_obs <- nrow(m_dat)
+
+# Hard floor: below 15 usable rows there's no point trying. The error
+# message tells the student exactly what to do (collect more data) rather
+# than producing a meaningless model.
+if (n_obs < 15) {
+  stop("Only ", n_obs, " usable rows. Not enough to fit a model. ",
+       "Add more entries to your tracker (aim for at least three weeks) and try again.")
+}
+
+# Heuristic: roughly 2 rounds per observation, capped at 100 and floored at
+# 20. The cap prevents long training times on the full year of class data;
+# the floor ensures even small datasets get enough rounds to find any
+# signal at all.
+n_rounds <- min(100, max(20, floor(n_obs * 2)))
+
+# Tree depth: shallower trees on small data reduce overfitting. The
+# threshold of 60 rows is a rough rule of thumb, not a hard cutoff.
+max_depth <- if (n_obs < 60) 3 else 6
+
+cat("Training XGBoost with nrounds =", n_rounds,
+    "and max_depth =", max_depth, "on", n_obs, "rows.\n")
+```
+
+## Fitting the model
+
+```{r}
+# ---- Build the XGBoost data structure ----
+# xgb.DMatrix is XGBoost's internal format. It bundles features and labels
+# together and pre-processes them for fast access during training. The
+# label argument is the response vector.
+dtrain <- xgb.DMatrix(data = as.matrix(m_dat), label = response)
+
+# ---- Train using the modern xgb.train API ----
+# We use xgb.train (rather than the older xgboost() wrapper) because it
+# accepts a structured params list, which is the convention in every other
+# session of this course.
+fit_1 <- xgb.train(
+  params = list(
+    objective = "reg:squarederror",  # standard squared-error regression
+    max_depth = max_depth,            # set above based on dataset size
+    eta = 0.1                         # learning rate; small + many rounds = stable
+  ),
+  data = dtrain,
+  nrounds = n_rounds,
+  verbose = 1,
+  print_every_n = 20
+)
+```
+
+## How well does the model actually fit?
+
+Before we interpret SHAP values, we need to know whether the model is worth
+interpreting. A SHAP plot will happily rank features by importance even for
+a model that explains almost none of the variance, so we check overall fit
+first. Two diagnostics are useful:
+
+  * **Predicted vs. actual scatter.** Points should cluster around the 45°
+    line if the model is tracking the target. Systematic departures (the
+    model consistently under-predicting high values, for example) are
+    visible here but hidden in aggregate metrics.
+  * **RMSE and R².** RMSE is in the units of the response (productivity
+    points) and answers "how far off is a typical prediction?" R² is the
+    share of variance the model captures, roughly comparable across
+    response variables.
+
+```{r fig.height=5, fig.width=6}
+# ---- Generate in-sample predictions ----
+# These are predictions on the same data we trained on, so they'll look
+# better than the model would look on held-out data. That's an honest
+# caveat to share with students: a good in-sample fit is necessary but
+# not sufficient for a useful model. For small personal datasets we
+# usually don't have enough data to hold out a meaningful test set.
+preds <- predict(fit_1, newdata = dtrain)
+
+# ---- Compute summary fit statistics ----
+# RMSE: square root of mean squared error, in response units
+rmse <- sqrt(mean((response - preds)^2))
+# R-squared: 1 - (residual variance / total variance)
+r2   <- 1 - sum((response - preds)^2) / sum((response - mean(response))^2)
+
+cat("In-sample RMSE:", round(rmse, 3),
+    "| R-squared:", round(r2, 3), "\n")
+
+# ---- Build the scatter plot data ----
+fit_df <- data.frame(actual = response, predicted = preds)
+
+# ---- Plot predicted vs actual with a 45-degree reference line ----
+# The reference line is where points would land if every prediction were
+# perfect. geom_abline adds it independent of the data range, so it
+# extends across the whole plot area.
+ggplot(fit_df, aes(x = actual, y = predicted)) +
+  geom_abline(slope = 1, intercept = 0, color = dark_sub,
+              linetype = "dashed", linewidth = 0.5) +
+  geom_point(color = accent_blue, alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "lm", se = FALSE, color = accent_gold,
+              linewidth = 0.7) +
+  labs(x = paste("Actual", response_metric),
+       y = paste("Predicted", response_metric),
+       title = "Predicted vs. actual",
+       subtitle = paste0("In-sample RMSE = ", round(rmse, 3),
+                         ", R-squared = ", round(r2, 3))) +
+  theme_hpa()
+```
+
+Interpreting the plot:
+
+  * **Tight clustering along the dashed line** means the model captures
+    most of the variation in the response.
+  * **A shallow gold line relative to the dashed line** means the model
+    is under-reactive: it predicts values closer to the mean than they
+    actually are. This is normal for gradient-boosted models on small
+    datasets because they regularize toward the global average.
+  * **Points far from the line** are observations the model couldn't
+    explain with the features we built. Looking at what days those are
+    (holidays, illness, unusual events) often suggests features worth
+    adding.
+
+If R² is low (say, below 0.2), treat the SHAP plot that follows as
+descriptive rather than prescriptive. Features may rank in a particular
+order, but the model doesn't explain enough of the response for that
+ranking to support strong claims.
+
+## SHAP: which features actually carry signal?
+
+`shapviz` computes SHAP values directly from the fitted model and the
+feature matrix, then gives us beeswarm and importance plots out of the box.
+Each dot in the beeswarm is one observation; horizontal position is that
+feature's contribution to the model's prediction for that day. Color encodes
+the feature's value (high = red, low = blue), so you can see at a glance
+whether *high* values of a given lagged metric push predicted productivity
+up or down.
+
+```{r}
+# ---- Construct the shapviz object ----
+# shapviz takes the fitted model and the feature matrix used to train it
+# and computes SHAP values for every observation. The X_pred matrix must
+# be in the same column order and have the same column names as the
+# training data.
+sv <- shapviz(fit_1, X_pred = as.matrix(m_dat))
+
+# ---- Beeswarm: distribution of SHAP values across observations ----
+# Each row in the plot is one feature; each dot is one day. Dot position
+# (left vs right) is the SHAP contribution; dot color is the feature value
+# itself. The combination tells you both how important a feature is and
+# the direction of its effect.
+sv_importance(sv, kind = "beeswarm", max_display = 15) +
+  scale_color_gradient(low = accent_blue, high = accent_red) +
+  labs(title = paste("SHAP feature importance, predicting", response_metric)) +
+  theme_hpa()
+
+# ---- Bar chart: mean absolute SHAP value ----
+# Easier to scan when you just want a ranking. The bar length is the average
+# magnitude of each feature's contribution, regardless of direction.
+sv_importance(sv, kind = "bar", max_display = 15, fill = accent_red) +
+  labs(title = paste("Mean |SHAP|, predicting", response_metric)) +
+  theme_hpa()
+```
+
+## SHAP dependence: how does the top feature affect predictions?
+
+The beeswarm and bar charts tell us *which* features matter. The dependence
+plot tells us *how* a feature matters. For a single feature, it plots the
+feature's value on the x axis and its SHAP contribution on the y axis,
+with one point per observation.
+
+Reading a dependence plot answers questions the ranking can't:
+
+  * **Is the relationship monotonic?** A clean upward slope means more is
+    always better (or worse); a curve that flattens means there's a
+    saturation point past which the feature stops mattering.
+  * **Is there a threshold?** Sometimes a feature has no effect until it
+    crosses a specific value, then a large effect above it. That shows up
+    as a step function in the dependence plot.
+  * **Is there interaction?** `sv_dependence` color-codes points by a
+    second feature it thinks interacts strongly with the main one, so you
+    can see whether the effect of sleep depends on, say, stress level.
+
+```{r fig.height=4, fig.width=7}
+# ---- Identify the top-ranked feature programmatically ----
+# Rather than hardcoding "mean_val_Sleep_Hours_7" (which might not be the
+# top feature on student data), we pull the name with the largest mean
+# absolute SHAP value directly from the shapviz object. shapviz stores
+# SHAP values in sv$S as a matrix with one column per feature.
+mean_abs_shap <- colMeans(abs(sv$S))
+top_feature   <- names(sort(mean_abs_shap, decreasing = TRUE))[1]
+cat("Top feature by mean |SHAP|:", top_feature, "\n")
+
+# ---- Dependence plot for the top feature ----
+# By default sv_dependence picks a second feature to color by using
+# SHAP interaction strength. The color scale ends up on whatever that
+# feature's natural range is, so we let shapviz pick the palette rather
+# than forcing our dark-theme colors.
+sv_dependence(sv, v = top_feature) +
+  labs(title = paste("SHAP dependence:", top_feature),
+       subtitle = "X = feature value, Y = SHAP contribution, color = interacting feature") +
+  theme_hpa()
+```
+
+A common pattern in this kind of data: the dependence plot for
+`mean_val_Sleep_Hours_7` often shows a roughly S-shaped curve, flat below
+some low threshold, rising through a middle zone, and flattening again
+past the point of diminishing returns. That shape is exactly what a linear
+model would miss and exactly what gradient-boosted trees can pick up.
+
+## Reading the output
+
+Two questions to ask of the SHAP plot:
+
+1. **Which metrics dominate?** If recent sleep summaries (mean, sum) sit at
+   the top, that's evidence the lagged-sleep story we built up visually
+   actually holds when other metrics are competing for attention.
+2. **Which window length wins?** Compare the same metric across lag tags
+   (`_1`, `_3`, `_7`). The window the model leans on tells you the timescale
+   over which that metric's signal accumulates.
+
+When you re-run this on your own data, expect the picture to look different,
+both because the metrics you tracked are different and because individual
+patterns vary a lot. The honest interpretation is that this model surfaces
+correlations in *your* observed window; it isn't a universal claim about
+how sleep affects productivity.
+
+---
+
+# Exercises: Day-of-Week Analysis
+
+Every metric we've looked at so far has been treated as a pure time series:
+we've asked whether yesterday, the last 3 days, or the last week predict
+today. But daily life has a weekly rhythm. Sleep on Saturday night tends
+to look different from sleep on Tuesday night. Stress on Monday morning
+tends to look different from stress on Friday afternoon. The `Day` column
+in the dataset lets us investigate those patterns directly.
+
+Work through the exercises below using the class `metric_data` (or your
+own if you've switched the toggle). Each exercise builds on the previous
+one, so work in order.
+
+### Exercise 1: Distribution of a metric by day of the week
+
+Build a boxplot of `Sleep_Hours` faceted or grouped by `Day` (Monday
+through Sunday). Use `theme_hpa()` and fill the boxes with `accent_blue`.
+
+Then answer:
+
+  a. Which day has the highest median sleep?
+  b. Which day has the widest spread (largest interquartile range)?
+  c. Are any days visibly skewed (median far from the mean)?
+
+*Hint:* `metric_data$Day` is a character column. To get the days in
+calendar order on the x axis rather than alphabetical, convert it to a
+factor with levels in the order you want:
+`factor(metric_data$Day, levels = c("Monday", "Tuesday", ..., "Sunday"))`.
+
+### Exercise 2: Comparing weekday and weekend
+
+Create a new column `is_weekend` that is `TRUE` when `Day` is Saturday or
+Sunday and `FALSE` otherwise. Then produce a side-by-side density plot
+(using `geom_density` with `fill` mapped to `is_weekend`) for two metrics
+of your choice.
+
+Answer:
+
+  a. Does the weekday/weekend difference look bigger for morning metrics
+     (Sleep_Hours, Wake_Up) or evening metrics (Productivity, Energy)?
+  b. Run a two-sample t-test (`t.test()`) comparing weekday vs. weekend
+     values for one of the metrics. Is the difference statistically
+     significant? What's the mean difference in practical terms?
+  c. Why might "statistically significant" and "practically important"
+     give different answers on this kind of data?
+
+### Exercise 3: Day-of-week effects in the residuals
+
+The predicted-vs-actual plot earlier showed where the model struggles.
+If day-of-week patterns matter and our features don't capture them, the
+model's errors (residuals) should depend on the day.
+
+  a. Compute residuals as `residuals <- response - preds`.
+  b. Build a data frame joining the residuals back to the `Day` column
+     from `metric_data` (careful: you dropped rows where the response
+     was missing, so indices need to match up). A safe way is to
+     re-filter `metric_data$Day[!is.na(metric_data[[response_metric]])]`.
+  c. Plot a boxplot of residuals by Day.
+  d. If a particular day has residuals systematically above or below
+     zero, the model is biased on that day. Which days show this, if
+     any? What feature could you add to capture it?
+
+### Exercise 4: Lagged features with day-of-week interaction
+
+Propose (but you don't need to fully build) a modeling approach that would
+let the effect of `mean_val_Sleep_Hours_7` depend on whether the prediction
+day is a weekday or a weekend.
+
+  a. One approach: add the interaction explicitly, e.g. create a column
+     `mean_sleep_weekend = mean_val_Sleep_Hours_7 * is_weekend`.
+  b. Another approach: fit separate models for weekdays and weekends and
+     compare their SHAP outputs.
+  c. What are the trade-offs between these two approaches? Think about
+     sample size in particular, because weekends give you roughly 2/7 of
+     the rows.
+
+### Exercise 5 (stretch): Writing up a finding
+
+Pick one day-of-week pattern you discovered in Exercises 1-3 and write
+a two-sentence summary in the FIRE framework (Finding, Implication,
+Recommendation, Evidence). Keep it concrete: "I noticed X" isn't a
+finding until you can say how big X is and how confident you are in it.
+
