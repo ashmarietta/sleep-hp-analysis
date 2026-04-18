@@ -5,19 +5,23 @@ The analysis consolidates daily observations into visualizations and insights th
 
 ## Key Documents
 
-- RMarkdown file containing full analysis (`04.15_assignment1.Rmd`)  
-- Dataset with daily tracking variables (`04.15_metrics.xlsx`)  
+- RMarkdown file containing full visualizations (`04.15_assignment1.Rmd`)
+- RMarkdown file containing XGBoost model (`04.14_metrics.Rmd`)
+  - Dataset for direct upload (`x04.15_metrics.xlsx`)
+- Dataset with daily tracking variables (`04.15_metrics.xlsx`)
 - Report with findings (`04.15_assignment1.docx`)
 
 ## Key Figures
 - Figure 1: Sleep Hours vs. Morning Alertness
 - Figure 2: Sleep Hours vs. Productivity
+- SHAP Values from Model Prediction
 
 ## Findings
 - Higher sleep duration is associated with increased morning alertness
 - Productivity generally improves with more sleep, though external factors can influence outcomes
 - Travel and late activity disrupt sleep consistency and reduce performance
 - Caffeine improves productivity but does not impact recorded morning alertness due to the timing of consumption
+- The three-day mean value of wake-up mood has the greatest impact on productivity
 
 ## Example Applications
 - Athlete performance monitoring
